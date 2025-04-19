@@ -10,37 +10,39 @@ import os
 # Allow loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-class DeblurDataset(Dataset):
-    def __init__(self, root_dir, split='train', crop_size=256):
+class SuperLowDataset(Dataset):
+    def __init__(self, root_dir, split='train', patch_size=256, scale_factor=4):
         """
-        Dataset for deblurring training/validation with support for multiple image extensions
+        Dataset for super-resolution training/validation
         
         Args:
-            root_dir: Root directory containing 'sharp' and 'blur' subdirectories
+            root_dir: Root directory containing high-resolution images
             split: 'train' or 'val'
-            crop_size: Size of training patches (only used during training)
+            patch_size: Size of high-resolution training patches (only used during training)
+            scale_factor: Downsampling factor for creating low-resolution images
         """
         self.root_dir = Path(root_dir)
         self.split = split
-        self.crop_size = crop_size
+        self.patch_size = patch_size
+        self.scale_factor = scale_factor
+        self.lr_patch_size = patch_size // scale_factor
         
-        # Get sharp images with multiple extensions
-        self.sharp_dir = self.root_dir / 'sharp'
-        self.blur_dir = self.root_dir / 'blur'
+        # Get high-resolution images with multiple extensions
+        self.hr_dir = self.root_dir
         
         # Common image extensions
         self.extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp']
         
-        # Get all sharp images
-        self.sharp_files = []
+        # Get all high-resolution images
+        self.hr_files = []
         for ext in self.extensions:
-            self.sharp_files.extend(list(self.sharp_dir.glob(f'*{ext}')))
-            self.sharp_files.extend(list(self.sharp_dir.glob(f'*{ext.upper()}')))
+            self.hr_files.extend(list(self.hr_dir.glob(f'*{ext}')))
+            self.hr_files.extend(list(self.hr_dir.glob(f'*{ext.upper()}')))
         
         # Sort the files to ensure deterministic behavior
-        self.sharp_files = sorted(self.sharp_files)
+        self.hr_files = sorted(self.hr_files)
         
-        print(f"Found {len(self.sharp_files)} images in {self.sharp_dir}")
+        print(f"Found {len(self.hr_files)} high-resolution images in {self.hr_dir}")
         
         # Basic transforms
         self.transform = transforms.Compose([
@@ -55,12 +57,12 @@ class DeblurDataset(Dataset):
         ]) if split == 'train' else None
         
     def __len__(self):
-        return len(self.sharp_files)
+        return len(self.hr_files)
     
     def get_random_crop_params(self, img):
-        """Get random crop parameters"""
+        """Get random crop parameters for high-resolution image"""
         w, h = img.size
-        th, tw = self.crop_size, self.crop_size
+        th, tw = self.patch_size, self.patch_size
         if w == tw and h == th:
             return 0, 0, h, w
         if w < tw or h < th:
@@ -74,73 +76,48 @@ class DeblurDataset(Dataset):
         j = random.randint(0, w - tw)
         return i, j, th, tw, img
     
+    def create_low_res(self, hr_img):
+        """Create low-resolution image by downscaling with bicubic interpolation"""
+        w, h = hr_img.size
+        lr_w, lr_h = w // self.scale_factor, h // self.scale_factor
+        lr_img = hr_img.resize((lr_w, lr_h), Image.BICUBIC)
+        return lr_img
+    
     def __getitem__(self, idx):
         try:
-            # Load sharp image
-            sharp_path = self.sharp_files[idx]
+            # Load high-resolution image
+            hr_path = self.hr_files[idx]
             
-            # Get corresponding blur image with same name
-            file_name = sharp_path.name
-            blur_path = self.blur_dir / file_name
-            
-            # If blur file doesn't exist with exact name, try matching without extension
-            if not blur_path.exists():
-                stem = sharp_path.stem
-                for ext in self.extensions:
-                    candidate = self.blur_dir / f"{stem}{ext}"
-                    if candidate.exists():
-                        blur_path = candidate
-                        break
-                    
-                    # Also try with uppercase extension
-                    candidate = self.blur_dir / f"{stem}{ext.upper()}"
-                    if candidate.exists():
-                        blur_path = candidate
-                        break
-            
-            # If still no match, use a fallback
-            if not blur_path.exists():
-                print(f"Warning: No matching blur image for {file_name}")
-                # Return a random sample as fallback
-                return self.__getitem__(random.randint(0, len(self) - 1))
-            
-            # Open images with PIL
+            # Open image with PIL
             try:
-                sharp_img = Image.open(sharp_path).convert('RGB')
-                blur_img = Image.open(blur_path).convert('RGB')
+                hr_img = Image.open(hr_path).convert('RGB')
             except Exception as e:
-                print(f"Error loading images: {e}")
+                print(f"Error loading image: {e}")
                 # Return a random sample as fallback
                 return self.__getitem__(random.randint(0, len(self) - 1))
-            
-            # Ensure both images have the same size
-            if sharp_img.size != blur_img.size:
-                blur_img = blur_img.resize(sharp_img.size, Image.BICUBIC)
             
             # Random crop for training
             if self.split == 'train':
                 # Handle random cropping with potential resizing
-                i, j, h, w, sharp_img_resized = self.get_random_crop_params(sharp_img)
-                if sharp_img_resized is not sharp_img:  # If image was resized
-                    sharp_img = sharp_img_resized
-                    blur_img = blur_img.resize(sharp_img.size, Image.BICUBIC)
+                i, j, h, w, hr_img_resized = self.get_random_crop_params(hr_img)
+                if hr_img_resized is not hr_img:  # If image was resized
+                    hr_img = hr_img_resized
                 
-                # Crop both images to the same region
-                sharp_img = sharp_img.crop((j, i, j + w, i + h))
-                blur_img = blur_img.crop((j, i, j + w, i + h))
+                # Crop high-resolution image
+                hr_img = hr_img.crop((j, i, j + w, i + h))
                 
                 # Apply augmentation
                 if random.random() > 0.5 and self.augment:
-                    state = torch.get_rng_state()
-                    sharp_img = self.augment(sharp_img)
-                    torch.set_rng_state(state)
-                    blur_img = self.augment(blur_img)
+                    hr_img = self.augment(hr_img)
+            
+            # Create low-resolution version
+            lr_img = self.create_low_res(hr_img)
             
             # Convert to tensors
-            sharp_tensor = self.transform(sharp_img)
-            blur_tensor = self.transform(blur_img)
+            hr_tensor = self.transform(hr_img)
+            lr_tensor = self.transform(lr_img)
             
-            return blur_tensor, sharp_tensor
+            return lr_tensor, hr_tensor
             
         except Exception as e:
             print(f"Error processing image {idx}: {e}")
@@ -148,10 +125,10 @@ class DeblurDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self) - 1))
 
 
-def create_dataloaders(root_dir_train, root_dir_val, batch_size=8, crop_size=256, num_workers=4):
-    """Create training and validation dataloaders"""
-    train_dataset = DeblurDataset(root_dir_train, split='train', crop_size=crop_size)
-    val_dataset   = DeblurDataset(root_dir_val, split='train', crop_size=crop_size)
+def create_dataloaders(root_dir_train, root_dir_val, batch_size=8, patch_size=256, scale_factor=4, num_workers=4):
+    """Create training and validation dataloaders for super-resolution"""
+    train_dataset = SuperLowDataset(root_dir_train, split='train', patch_size=patch_size, scale_factor=scale_factor)
+    val_dataset = SuperLowDataset(root_dir_val, split='train', patch_size=patch_size, scale_factor=scale_factor)
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
